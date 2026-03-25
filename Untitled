@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+import sys, re, warnings, glob
+from pathlib import Path
+warnings.filterwarnings("ignore")
+import requests
+from bs4 import BeautifulSoup
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+BD = "\033[1m"; Y = "\033[93m"; G = "\033[92m"; R = "\033[91m"; DM = "\033[2m"; RS = "\033[0m"
+
+# ── Paths (same folder as this script) ────────────────────────
+SCRIPT_DIR = Path(__file__).resolve().parent
+CSV_DIR    = SCRIPT_DIR.parent / "CSV TICKER LISTS"
+
+def fetch(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        return BeautifulSoup(r.text, "html.parser") if r.status_code == 200 else None
+    except: return None
+
+def get_pairs(soup):
+    d = {}
+    for t in soup.find_all("table"):
+        for row in t.find_all("tr"):
+            c = row.find_all("td")
+            if len(c) == 2: d[c[0].get_text(strip=True)] = c[1].get_text(strip=True)
+    return d
+
+def get_holdings(soup, n=5):
+    h = []
+    for t in soup.find_all("table"):
+        hdr = " ".join(th.get_text(strip=True) for th in t.find_all("th"))
+        if "Weight" in hdr and "Name" in hdr:
+            for row in t.find_all("tr")[1:]:
+                c = row.find_all("td")
+                if len(c) >= 3:
+                    if c[0].get_text(strip=True).isdigit():
+                        h.append({"s": c[1].get_text(strip=True), "n": c[2].get_text(strip=True), "w": c[3].get_text(strip=True) if len(c)>3 else ""})
+                    else:
+                        h.append({"s": c[1].get_text(strip=True), "n": c[0].get_text(strip=True), "w": c[2].get_text(strip=True)})
+                if len(h) >= n: break
+            break
+    return h
+
+def get_hstats(soup):
+    s, text = {}, soup.get_text(" ", strip=True)
+    for k, p in {"Total Holdings": r"Total Holdings\s+(\d[\d,]*)", "Top 10 Percentage": r"Top 10 Percentage\s+([\d.]+%)", "Asset Class": r"Asset Class\s+(\w[\w\s]*?)(?=ETF Category|Assets|PE Ratio|$)", "Assets": r"Assets\s+(\$?[\d,.]+[BMK]?)", "PE Ratio": r"PE Ratio\s+([\d.]+)"}.items():
+        m = re.search(p, text)
+        if m: s[k] = m.group(1).strip()
+    return s
+
+def wrap(text):
+    line = "  "
+    for w in text.split():
+        if len(line) + len(w) + 1 > 62:
+            print(line); line = "  " + w
+        else: line = line + " " + w if line.strip() else "  " + w
+    if line.strip(): print(line)
+
+if len(sys.argv) < 2:
+    print(R + "Usage: etf <TICKER>" + RS); sys.exit(1)
+
+tk = sys.argv[1].strip().upper()
+print("\n" + DM + "Looking up " + BD + tk + RS + DM + "..." + RS)
+
+ov = fetch("https://stockanalysis.com/etf/" + tk.lower() + "/")
+hl = fetch("https://stockanalysis.com/etf/" + tk.lower() + "/holdings/")
+if not ov: print(R + "  Not found or failed." + RS); sys.exit(1)
+
+st = get_pairs(ov)
+top = get_holdings(ov, 5)
+hs = get_hstats(hl) if hl else {}
+if len(top) < 5 and hl: top = get_holdings(hl, 5)
+
+th = st.get("Holdings", hs.get("Total Holdings", "N/A"))
+t10 = hs.get("Top 10 Percentage", "N/A")
+pe = st.get("PE Ratio", hs.get("PE Ratio", "N/A"))
+beta = st.get("Beta", "N/A")
+assets = st.get("Assets", hs.get("Assets", "N/A"))
+ac = hs.get("Asset Class", "equity")
+
+t5 = ", ".join(h["n"] + " (" + h["s"] + ") at " + h["w"] for h in top)
+
+print()
+print("  " + BD + Y + tk + " SUMMARY" + RS)
+print("  " + DM + "-" * 56 + RS)
+s = tk + " is an " + ac.lower() + " ETF with a total of " + str(th) + " individual holdings."
+s += " The top holdings are " + t5 + "."
+s += " It has a PE ratio of " + str(pe) + ", beta of " + str(beta) + ", and total assets of " + str(assets) + "."
+if t10 != "N/A": s += " The top 10 holdings make up " + t10 + " of the fund."
+wrap(s)
+print()
+
+# ── Top 5 Holdings (simple) ───────────────────────────────────
+if top:
+    print("  " + BD + Y + tk + " TOP 5 HOLDINGS" + RS)
+    print("  " + DM + "-" * 46 + RS)
+    for i, h in enumerate(top, 1):
+        print(f"  {i}. {BD}{h['s']:<8}{RS}  {h['n']:<35}  {Y}{h['w']:>6}{RS}")
+    print()
+
+# ── ETF Issuer + Market Cap ───────────────────────────────────
+ISSUER_TICKERS = {
+    "state street": "STT",
+    "blackrock": "BLK",
+    "invesco": "IVZ",
+    "charles schwab": "SCHW",
+    "jpmorgan": "JPM",
+    "first trust": None,
+    "wisdomtree": "WETF",
+    "vaneck": None,
+    "dimensional": None,
+    "pacer": None,
+    "global x": None,
+    "direxion": None,
+    "proshares": None,
+}
+
+def flatten(d, prefix=""):
+    out = {}
+    if isinstance(d, dict):
+        for k, v in d.items(): out.update(flatten(v, f"{prefix}{k}."))
+    elif isinstance(d, list):
+        for i, v in enumerate(d): out.update(flatten(v, f"{prefix}{i}."))
+    else: out[prefix.rstrip(".")] = d
+    return out
+
+def fmt_mcap(f):
+    if f >= 1e12: return f"${f/1e12:.2f}T"
+    if f >= 1e9:  return f"${f/1e9:.1f}B"
+    if f >= 1e6:  return f"${f/1e6:.0f}M"
+    return "N/A"
+
+try:
+    import pandas as pd
+    etf_csv = sorted(glob.glob(str(CSV_DIR / "screener-etf-*.csv")) +
+                     glob.glob(str(CSV_DIR / "screener-etf-for-ranking-*.csv")))
+    issuer = None
+    if etf_csv:
+        edf = pd.read_csv(etf_csv[-1], low_memory=False)
+        edf.columns = [c.strip() for c in edf.columns]
+        row = edf[edf["Symbol"].str.upper() == tk]
+        if not row.empty:
+            issuer = str(row.iloc[0].get("Issuer", "") or "").strip()
+
+    if issuer:
+        # Find ticker
+        sym = None
+        for key, val in ISSUER_TICKERS.items():
+            if key in issuer.lower():
+                sym = val
+                break
+        # Fetch market cap
+        mcap_str = "Private / N/A"
+        if sym:
+            try:
+                r = requests.get(f"https://stockanalysis.com/stocks/{sym.lower()}/statistics/__data.json",
+                                 headers=HEADERS, timeout=8)
+                if r.status_code == 200:
+                    flat = flatten(r.json())
+                    for k, v in flat.items():
+                        if "marketcap" in k.lower():
+                            try:
+                                f = float(v)
+                                if f > 1e8:
+                                    mcap_str = fmt_mcap(f)
+                                    break
+                            except: pass
+            except: pass
+
+        print("  " + BD + Y + tk + " ISSUER" + RS)
+        print("  " + DM + "-" * 46 + RS)
+        print(f"  Issuer     : {BD}{issuer}{RS}")
+        print(f"  Market Cap : {Y}{mcap_str}{RS}")
+        print()
+except: pass
+
+# ── Industry breakdown from holdings map ──────────────────────
+try:
+    import pandas as pd
+
+    # Load holdings map
+    map_files = sorted(glob.glob(str(SCRIPT_DIR.parent / "etf_holdings_map_*.csv")))
+    if not map_files:
+        raise FileNotFoundError("No etf_holdings_map_*.csv found")
+    map_df = pd.read_csv(map_files[-1])
+    etf_holdings = map_df[map_df["ETF"] == tk]["Symbol"].tolist()
+    if not etf_holdings:
+        raise ValueError(f"No holdings found for {tk} in map")
+
+    # Load stock→industry map
+    stock_files = sorted(glob.glob(str(CSV_DIR / "screener-stocks-*.csv")))
+    if not stock_files:
+        raise FileNotFoundError("No screener-stocks CSV found")
+    sdf = pd.read_csv(stock_files[-1], low_memory=False)
+    sdf.columns = [c.strip() for c in sdf.columns]
+    sym_col = next((c for c in sdf.columns if c.lower() == "symbol"), None)
+    ind_col = next((c for c in sdf.columns if c.lower() == "industry"), None)
+    sec_col = next((c for c in sdf.columns if c.lower() == "sector"), None)
+    if not sym_col or not ind_col:
+        raise ValueError("Missing Symbol or Industry column in screener CSV")
+
+    sym_to_ind = {}
+    for _, row in sdf.iterrows():
+        s = str(row[sym_col]).strip().upper()
+        sym_to_ind[s] = str(row[ind_col]).strip() if pd.notna(row[ind_col]) else ""
+
+    from collections import Counter
+    ind_counts = Counter()
+    total = 0
+    for sym in etf_holdings:
+        ind = sym_to_ind.get(sym.upper(), "")
+        if ind and ind.lower() not in ("", "nan", "n/a"):
+            ind_counts[ind] += 1
+            total += 1
+
+    if total == 0:
+        raise ValueError("No industry data matched")
+
+    print("  " + BD + Y + tk + " INDUSTRY BREAKDOWN" + RS)
+    print("  " + DM + "-" * 56 + RS)
+    print("  {:<38}  {:>5}  {:>6}".format("Industry", "Count", "Weight"))
+    print("  " + DM + "-" * 56 + RS)
+    bar_max = 20
+    for ind, count in ind_counts.most_common():
+        pct = count / total * 100
+        bar = "█" * int(pct / 100 * bar_max)
+        color = G if pct >= 20 else Y if pct >= 10 else DM
+        print(f"  {color}{ind:<38}  {count:>5}  {pct:>5.1f}%  {bar}{RS}")
+    print(f"\n  {DM}Based on {total} holdings with known industry  ({len(etf_holdings)} total){RS}")
+    print()
+
+except Exception as e:
+    print(f"  {DM}(Industry breakdown unavailable: {e}){RS}\n")
