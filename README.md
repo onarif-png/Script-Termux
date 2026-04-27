@@ -1,2 +1,0 @@
-# Script-Termux
-Python script
